@@ -101,5 +101,3 @@ npm run build
 - **Làm sạch đầu vào**: Tên bảng được kiểm tra hợp lệ trong các công cụ tìm kiếm để tránh lỗi SQL Injection.
 
 ## 📜 Giấy phép
-
-ISC
