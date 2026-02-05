@@ -18,6 +18,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import pg from "pg";
 
@@ -32,6 +34,11 @@ const DATABASE_URL = process.env.DATABASE_URL;
 // default PG environment variables (PGHOST, PGUSER, etc.)
 const pool = new Pool(DATABASE_URL ? { connectionString: DATABASE_URL } : undefined);
 
+// Add global error handler for the pool to prevent process crash on idle client errors
+pool.on('error', (err) => {
+    console.error('Unexpected error on idle client', err);
+});
+
 const server = new Server(
   {
     name: "mcp-postgre-server",
@@ -40,6 +47,7 @@ const server = new Server(
   {
     capabilities: {
       tools: {},
+      resources: {},
     },
   }
 );
@@ -55,13 +63,91 @@ async function runQuery(sql: string, args: any[] = []) {
   }
 }
 
-// List Tables
+// List Resources (Expose tables as resources)
+server.setRequestHandler(ListResourcesRequestSchema, async () => {
+    const client = await pool.connect();
+    try {
+        const sql = `
+            SELECT table_schema, table_name 
+            FROM information_schema.tables 
+            WHERE table_schema NOT IN ('information_schema', 'pg_catalog') 
+            ORDER BY table_schema, table_name
+        `;
+        const result = await client.query(sql);
+        
+        const resources = result.rows.map(row => ({
+            uri: `postgres://${row.table_schema}/${row.table_name}`,
+            mimeType: "application/json",
+            name: `${row.table_schema}.${row.table_name}`,
+            description: `Table ${row.table_name} in schema ${row.table_schema}`
+        }));
+
+        return {
+            resources
+        };
+    } finally {
+        client.release();
+    }
+});
+
+// Read Resource
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    const { uri } = request.params;
+    const url = new URL(uri);
+    
+    // Validate protocol
+    if (url.protocol !== 'postgres:') {
+        throw new Error("Invalid resource protocol");
+    }
+
+    const pathParts = url.pathname.split('/').filter(p => p.length > 0);
+    // Expecting //hostname/schema/table or //schema/table depending on URL parsing
+    // URL("postgres://public/users") -> hostname="public", pathname="/users"
+    
+    let schema, table;
+    if (url.hostname) {
+        schema = url.hostname;
+        table = pathParts[0];
+    } else {
+        // Fallback if hostname is empty (unlikely with valid URI)
+        schema = pathParts[0];
+        table = pathParts[1];
+    }
+
+    if (!schema || !table) {
+        throw new Error("Invalid resource URI format. Expected postgres://schema/table");
+    }
+
+    // Safety checks
+    if (!/^[a-zA-Z0-9_]+$/.test(schema) || !/^[a-zA-Z0-9_]+$/.test(table)) {
+        throw new Error("Invalid schema or table name in URI");
+    }
+
+    const client = await pool.connect();
+    try {
+        // Read first 100 rows as a preview
+        const sql = `SELECT * FROM "${schema}"."${table}" LIMIT 100`;
+        const result = await client.query(sql);
+
+        return {
+            contents: [{
+                uri: uri,
+                mimeType: "application/json",
+                text: JSON.stringify(result.rows, null, 2)
+            }]
+        };
+    } finally {
+        client.release();
+    }
+});
+
+// List Tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
         name: "list_tables",
-        description: "List all public tables in the database",
+        description: "List all tables and views in the database (includes schema information)",
         inputSchema: {
           type: "object",
           properties: {},
@@ -156,7 +242,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     if (name === "list_tables") {
       const result = await runQuery(
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
+        `SELECT table_schema, table_name, table_type 
+         FROM information_schema.tables 
+         WHERE table_schema NOT IN ('information_schema', 'pg_catalog') 
+         ORDER BY table_schema, table_name`
       );
       return {
         content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }],
@@ -254,21 +343,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             return { content: [{ type: "text", text: `No text columns found in table '${tableName}' to search.` }] };
         }
 
-        // 2. Build Query
-        const whereClause = columns.map(col => `"${col}" ILIKE $2`).join(" OR ");
-        const sql = `SELECT * FROM "${tableName}" WHERE ${whereClause} LIMIT 50`;
-        
-        const result = await runQuery(sql, [tableName, `%${term}%`]); // Note: $1 is not used in dynamic SQL construction for table name safely usually requires identifier quoting but here we are simplistic. Use with caution or improve robust quoting.
-        // Actually, for parameter $2 we need the term.
-        // Correct approach for dynamic table name in PG is to quote identifier, NOT use parameter for table name.
-        
-        // Let's re-do query construction safely for the table name
+        // 2. Validate table name to prevent SQL Injection
         // Simple sanitization: only allow alphanumeric + underscore
         if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
              throw new Error("Invalid table name for search");
         }
-        
-        const safeSql = `SELECT * FROM "${tableName}" WHERE ${columns.map((col, idx) => `"${col}" ILIKE $1`).join(" OR ")} LIMIT 50`;
+
+        // 3. Build and Execute Query
+        const safeSql = `SELECT * FROM "${tableName}" WHERE ${columns.map((col) => `"${col}" ILIKE $1`).join(" OR ")} LIMIT 50`;
         const searchResult = await runQuery(safeSql, [`%${term}%`]);
         
         return {
