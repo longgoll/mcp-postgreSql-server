@@ -6,6 +6,7 @@ console.log = console.error;
 import { fileURLToPath } from 'url';
 
 import { dirname, join } from 'path';
+import fs from 'fs';
 import dotenv from 'dotenv';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
@@ -28,16 +29,92 @@ import pg from "pg";
 
 const { Pool } = pg;
 
-const DATABASE_URL = process.env.DATABASE_URL;
+// New configuration interfaces
+interface DatabaseConfig {
+  name: string;
+  connectionString: string;
+  is_default?: boolean;
+}
 
-// We will use a pool. If DATABASE_URL is not provided, the pool will try to use
-// default PG environment variables (PGHOST, PGUSER, etc.)
-const pool = new Pool(DATABASE_URL ? { connectionString: DATABASE_URL } : undefined);
+interface PostgresServerConfig {
+  databases: DatabaseConfig[];
+}
 
-// Add global error handler for the pool to prevent process crash on idle client errors
-pool.on('error', (err) => {
-    console.error('Unexpected error on idle client', err);
-});
+interface McpConfig {
+  mcpServers: {
+    "postgre-server": {
+      postgresConfig: PostgresServerConfig;
+    };
+  };
+}
+
+const pools = new Map<string, pg.Pool>();
+let defaultDatabaseName: string | undefined;
+
+// Function to initialize pools
+function initializePools() {
+  const configFile = process.env.POSTGRES_CONFIG_FILE;
+  
+  if (configFile && fs.existsSync(configFile)) {
+    try {
+      const configContent = fs.readFileSync(configFile, 'utf8');
+      const config = JSON.parse(configContent) as McpConfig;
+      
+      const postgresConfig = config.mcpServers?.["postgre-server"]?.postgresConfig;
+      
+      if (postgresConfig && Array.isArray(postgresConfig.databases)) {
+        console.error(`Loading configuration from ${configFile}`);
+        
+        for (const dbConfig of postgresConfig.databases) {
+          try {
+            const pool = new Pool({ connectionString: dbConfig.connectionString });
+            
+            // Add error handler for each pool
+            pool.on('error', (err) => {
+              console.error(`Unexpected error on idle client for database ${dbConfig.name}`, err);
+            });
+            
+            pools.set(dbConfig.name, pool);
+            console.error(`Initialized pool for database: ${dbConfig.name}`);
+            
+            if (dbConfig.is_default) {
+              defaultDatabaseName = dbConfig.name;
+            }
+          } catch (error) {
+            console.error(`Failed to initialize pool for ${dbConfig.name}:`, error);
+          }
+        }
+      }
+    } catch (error) {
+      console.error(`Error reading or parsing config file: ${error}`);
+    }
+  }
+
+  // Fallback to environment variable if no pools loaded from config
+  if (pools.size === 0) {
+    const DATABASE_URL = process.env.DATABASE_URL;
+    if (DATABASE_URL) {
+      console.error("Using DATABASE_URL from environment");
+      const pool = new Pool({ connectionString: DATABASE_URL });
+      pool.on('error', (err) => {
+        console.error('Unexpected error on idle client', err);
+      });
+      const defaultName = 'default';
+      pools.set(defaultName, pool);
+      defaultDatabaseName = defaultName;
+    } else {
+        // Try standard PG env vars
+        console.error("Using standard PG environment variables");
+        const pool = new Pool(); // Uses PGHOST, PGUSER, etc.
+        pool.on('error', (err) => console.error('Unexpected error on idle client', err));
+        const defaultName = 'default';
+        pools.set(defaultName, pool);
+        defaultDatabaseName = defaultName;
+    }
+  }
+}
+
+initializePools();
 
 const server = new Server(
   {
@@ -53,7 +130,22 @@ const server = new Server(
 );
 
 // Helper for query execution
-async function runQuery(sql: string, args: any[] = []) {
+// Helper for query execution
+async function runQuery(sql: string, args: any[] = [], databaseName?: string) {
+  let targetDb = databaseName || defaultDatabaseName;
+  if (!targetDb && pools.size === 1) {
+    targetDb = pools.keys().next().value;
+  }
+  
+  if (!targetDb) {
+      throw new Error(`No database selected and no default database configured. Available: ${Array.from(pools.keys()).join(', ')}`);
+  }
+
+  const pool = pools.get(targetDb);
+  if (!pool) {
+    throw new Error(`Database '${targetDb}' not found. Available: ${Array.from(pools.keys()).join(', ')}`);
+  }
+
   const client = await pool.connect();
   try {
     const result = await client.query(sql, args);
@@ -65,29 +157,37 @@ async function runQuery(sql: string, args: any[] = []) {
 
 // List Resources (Expose tables as resources)
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
-    const client = await pool.connect();
-    try {
-        const sql = `
-            SELECT table_schema, table_name 
-            FROM information_schema.tables 
-            WHERE table_schema NOT IN ('information_schema', 'pg_catalog') 
-            ORDER BY table_schema, table_name
-        `;
-        const result = await client.query(sql);
-        
-        const resources = result.rows.map(row => ({
-            uri: `postgres://${row.table_schema}/${row.table_name}`,
-            mimeType: "application/json",
-            name: `${row.table_schema}.${row.table_name}`,
-            description: `Table ${row.table_name} in schema ${row.table_schema}`
-        }));
-
-        return {
-            resources
-        };
-    } finally {
-        client.release();
+    const resources: any[] = [];
+    
+    for (const [dbName, pool] of pools.entries()) {
+        const client = await pool.connect();
+        try {
+            const sql = `
+                SELECT table_schema, table_name 
+                FROM information_schema.tables 
+                WHERE table_schema NOT IN ('information_schema', 'pg_catalog') 
+                ORDER BY table_schema, table_name
+            `;
+            const result = await client.query(sql);
+            
+            const dbResources = result.rows.map(row => ({
+                uri: `postgres://${dbName}/${row.table_schema}/${row.table_name}`,
+                mimeType: "application/json",
+                name: `${dbName}.${row.table_schema}.${row.table_name}`,
+                description: `Table ${row.table_name} in schema ${row.table_schema} of database ${dbName}`
+            }));
+            
+            resources.push(...dbResources);
+        } catch (error) {
+            console.error(`Error listing tables for database ${dbName}:`, error);
+        } finally {
+            client.release();
+        }
     }
+
+    return {
+        resources
+    };
 });
 
 // Read Resource
@@ -101,26 +201,71 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     }
 
     const pathParts = url.pathname.split('/').filter(p => p.length > 0);
-    // Expecting //hostname/schema/table or //schema/table depending on URL parsing
-    // URL("postgres://public/users") -> hostname="public", pathname="/users"
+    // Potential formats:
+    // 1. //hostname/schema/table (hostname might be schema or db)
+    // 2. ///schema/table (no hostname)
     
-    let schema, table;
-    if (url.hostname) {
-        schema = url.hostname;
-        table = pathParts[0];
+    let dbName: string | undefined = defaultDatabaseName;
+    let schema: string;
+    let table: string;
+
+    const hostname = url.hostname;
+    
+    if (hostname) {
+        // If hostname matches a known DB, assume db/schema/table structure
+        if (pools.has(hostname)) {
+            dbName = hostname;
+            if (pathParts.length < 2) {
+                 throw new Error("Invalid resource URI. Expected postgres://database/schema/table");
+            }
+            schema = pathParts[0];
+            table = pathParts[1];
+        } else {
+            // Assume hostname is schema (legacy/default db support)
+            // postgres://schema/table
+            schema = hostname;
+            if (pathParts.length < 1) {
+                // edge case postgres://schema/table where table is pathParts[0]
+                table = pathParts[0];
+            } else {
+                table = pathParts[0];
+            }
+        }
     } else {
-        // Fallback if hostname is empty (unlikely with valid URI)
-        schema = pathParts[0];
-        table = pathParts[1];
+        // No hostname? postgres:///schema/table ??
+        // fallback to path parts
+        if (pathParts.length >= 3) {
+             // maybe db/schema/table
+             if (pools.has(pathParts[0])) {
+                 dbName = pathParts[0];
+                 schema = pathParts[1];
+                 table = pathParts[2];
+             } else {
+                 schema = pathParts[0];
+                 table = pathParts[1];
+             }
+        } else {
+            schema = pathParts[0];
+            table = pathParts[1];
+        }
+    }
+
+    if (!dbName) {
+        throw new Error("No database context found for URI");
     }
 
     if (!schema || !table) {
-        throw new Error("Invalid resource URI format. Expected postgres://schema/table");
+        throw new Error("Invalid resource URI. Missing schema or table.");
     }
 
     // Safety checks
     if (!/^[a-zA-Z0-9_]+$/.test(schema) || !/^[a-zA-Z0-9_]+$/.test(table)) {
         throw new Error("Invalid schema or table name in URI");
+    }
+    
+    const pool = pools.get(dbName);
+    if (!pool) {
+        throw new Error(`Database '${dbName}' not found`);
     }
 
     const client = await pool.connect();
@@ -150,7 +295,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description: "List all tables and views in the database (includes schema information)",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            database: { type: "string", description: "Optional database name to query" }
+          },
         },
       },
       {
@@ -160,6 +307,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             table_name: { type: "string" },
+            database: { type: "string", description: "Optional database name to query" }
           },
           required: ["table_name"],
         },
@@ -171,6 +319,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             type: "object",
             properties: {
                 table_name: { type: "string" },
+                database: { type: "string", description: "Optional database name to query" }
             },
             required: ["table_name"]
         }
@@ -182,6 +331,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             type: "object",
             properties: {
                 table_name: { type: "string" },
+                database: { type: "string", description: "Optional database name to query" }
             },
             required: ["table_name"]
         }
@@ -193,6 +343,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             sql_query: { type: "string" },
+            database: { type: "string", description: "Optional database name to query" }
           },
           required: ["sql_query"],
         },
@@ -204,6 +355,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             sql_query: { type: "string" },
+            database: { type: "string", description: "Optional database name to query" }
           },
           required: ["sql_query"],
         },
@@ -215,7 +367,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "object",
                   properties: {
                       table_name: { type: "string" },
-                      search_term: { type: "string" }
+                      search_term: { type: "string" },
+                      database: { type: "string", description: "Optional database name to query" }
                   },
               required: ["table_name", "search_term"]
           }
@@ -227,6 +380,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             sql_query: { type: "string" },
+            database: { type: "string", description: "Optional database name to query" }
           },
           required: ["sql_query"],
         },
@@ -238,6 +392,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   const safeArgs = args as Record<string, any>;
+  const databaseName = safeArgs?.database as string | undefined;
 
   try {
     if (name === "list_tables") {
@@ -245,7 +400,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `SELECT table_schema, table_name, table_type 
          FROM information_schema.tables 
          WHERE table_schema NOT IN ('information_schema', 'pg_catalog') 
-         ORDER BY table_schema, table_name`
+         ORDER BY table_schema, table_name`,
+        [],
+        databaseName
       );
       return {
         content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }],
@@ -256,7 +413,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const tableName = safeArgs.table_name;
       const result = await runQuery(
         "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position",
-        [tableName]
+        [tableName],
+        databaseName
       );
       return {
         content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }],
@@ -287,7 +445,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 t.relname,
                 i.relname;
         `;
-        const result = await runQuery(sql, [tableName]);
+        const result = await runQuery(sql, [tableName], databaseName);
         return {
             content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }]
         };
@@ -305,7 +463,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `;
         // Handle generic error if table doesn't exist by try-catch in runQuery wrapper effectively,
         // but here we might get 'relation does not exist' error which we catch below.
-        const result = await runQuery(sql, [tableName]);
+        const result = await runQuery(sql, [tableName], databaseName);
         
         // Map constraint types for better readability
         const typeMap: Record<string, string> = {
@@ -335,7 +493,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const colsResult = await runQuery(
             `SELECT column_name FROM information_schema.columns 
              WHERE table_name = $1 AND data_type IN ('text', 'character varying', 'char', 'name')`,
-            [tableName]
+            [tableName],
+            databaseName
         );
         
         const columns = colsResult.rows.map(r => r.column_name);
@@ -351,7 +510,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // 3. Build and Execute Query
         const safeSql = `SELECT * FROM "${tableName}" WHERE ${columns.map((col) => `"${col}" ILIKE $1`).join(" OR ")} LIMIT 50`;
-        const searchResult = await runQuery(safeSql, [`%${term}%`]);
+        const searchResult = await runQuery(safeSql, [`%${term}%`], databaseName);
         
         return {
              content: [{ type: "text", text: JSON.stringify(searchResult.rows, null, 2) }]
@@ -364,7 +523,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!isReadOnly(sql)) {
         throw new Error("Query is not read-only. Use run_modification_query for this operation.");
       }
-      const result = await runQuery(sql);
+      const result = await runQuery(sql, [], databaseName);
       return {
         content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }],
       };
@@ -374,7 +533,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const sql = safeArgs.sql_query;
         // Postgres EXPLAIN (JSON format is best for programmatic) or TEXT
         const explainSql = `EXPLAIN (FORMAT JSON) ${sql}`;
-        const result = await runQuery(explainSql);
+        const result = await runQuery(explainSql, [], databaseName);
         return {
             content: [{ type: "text", text: JSON.stringify(result.rows[0]['QUERY PLAN'], null, 2) }]
         };
@@ -382,7 +541,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (name === "run_modification_query") {
       const sql = safeArgs.sql_query;
-      const result = await runQuery(sql);
+      const result = await runQuery(sql, [], databaseName);
       return {
          content: [{ type: "text", text: JSON.stringify({
             rowCount: result.rowCount,
